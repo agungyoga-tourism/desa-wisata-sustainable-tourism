@@ -34,50 +34,36 @@ def load_embedding_model():
 
 @st.cache_data
 def prepare_and_embed_knowledge_base(_corpus_db, _anchors_db, _model):
-    st.info("Mempersiapkan basis pengetahuan...")
+    # ... (Fungsi ini tetap sama) ...
     corpus_cols = ['title', 'abstract', 'key_arguments_findings', 'critical_comments_linkages', 'outcome_notes', 'notes']
     anchor_cols = ['citation_full', 'abstract', 'verbatim_definition', 'typology_summary', 'purpose_quote', 'notes']
-    
     corpus_copy = _corpus_db.copy()
     anchors_copy = _anchors_db.copy()
-
     corpus_copy['text_for_embedding'] = corpus_copy[corpus_cols].fillna('').agg(' '.join, axis=1)
     anchors_copy['text_for_embedding'] = anchors_copy[anchor_cols].fillna('').agg(' '.join, axis=1)
-    
     combined_db = pd.concat([
         corpus_copy[['doc_id', 'rrn', 'citation_full', 'text_for_embedding']],
         anchors_copy[['anchor_id', 'citation_full', 'text_for_embedding']]
     ], ignore_index=True)
-    
     combined_db['unique_id'] = combined_db.apply(
         lambda row: f"RRN{str(int(row['doc_id'])).zfill(3)}" if pd.notna(row['doc_id']) else row['anchor_id'], axis=1
     )
-    
     knowledge_base = combined_db.dropna(subset=['text_for_embedding'])
-    st.success(f"Basis pengetahuan dengan {len(knowledge_base)} dokumen berhasil disiapkan.")
-
-    st.info("Membuat embeddings (representasi numerik)...")
     embeddings = _model.encode(knowledge_base['text_for_embedding'].tolist())
-    st.success(f"Berhasil membuat {len(embeddings)} embeddings.")
-    
     return knowledge_base, embeddings
 
 def retrieve_semantic_context(query, knowledge_base_df, embeddings_matrix, model, top_n=5, threshold=0.5):
+    # ... (Fungsi ini tetap sama) ...
     query_embedding = model.encode(query)
     similarities = cosine_similarity([query_embedding], embeddings_matrix)[0]
-    
     all_indices = np.argsort(similarities)[::-1]
     all_scores = similarities[all_indices]
-    
     relevant_indices = all_indices[all_scores > threshold]
     relevant_scores = all_scores[all_scores > threshold]
-    
     final_indices = relevant_indices[:top_n]
     final_scores = relevant_scores[:top_n]
-    
     if len(final_indices) == 0:
         return pd.DataFrame()
-        
     retrieved_df = knowledge_base_df.iloc[final_indices].copy()
     retrieved_df['similarity_score'] = final_scores
     return retrieved_df
@@ -94,22 +80,41 @@ def generate_narrative_answer(query, context_df):
         return None
 
     model = genai.GenerativeModel('gemini-2.5-flash')
-    context_text = "Berikut adalah potongan-potongan informasi relevan dari basis data riset:\n\n"
+    
+    # --- PERUBAHAN KUNCI: Menambahkan Meta-Konteks ---
+    meta_context_text = """
+    Seluruh basis data yang digunakan sebagai sumber pengetahuan berasal dari sebuah scoping review sistematis (2015-2025) tentang 'Desa Wisata'. 
+    Semua 99 dokumen di dalamnya telah melalui proses penyaringan yang ketat dengan kriteria inklusi yang berfokus secara eksplisit pada 'tourism village', 'community-based tourism' pada skala desa, atau 'village-level rural tourism'. 
+    Oleh karena itu, Anda harus mengasumsikan bahwa semua informasi yang diberikan sudah berada dalam konteks 'desa wisata'.
+    """
+
+    context_text = "Berikut adalah potongan-potongan informasi yang paling relevan yang ditemukan untuk pertanyaan spesifik ini:\n\n"
     for index, row in context_df.iterrows():
         context_text += f"--- Dokumen (ID: {row['unique_id']}) ---\nSitasi: {row['citation_full']}\nKutipan Relevan: {row['text_for_embedding'][:1500]}...\n\n"
     
     prompt = f"""
-    PERINTAH UTAMA: Jawab pertanyaan pengguna HANYA berdasarkan KONTEKS yang disediakan. JANGAN gunakan pengetahuan eksternal. 
-    Jika informasi tidak ada di dalam KONTEKS, jawab secara eksplisit: "Informasi untuk menjawab pertanyaan ini tidak ditemukan dalam dokumen yang relevan."
-    Sebutkan ID Dokumen untuk setiap klaim.
+    PERAN: Anda adalah asisten riset ahli yang sangat teliti.
 
-    KONTEKS:
+    META-KONTEKS KESELURUHAN:
+    {meta_context_text}
+
+    TUGAS ANDA:
+    1. Baca dan pahami META-KONTEKS di atas. Ini adalah kebenaran universal untuk semua pertanyaan.
+    2. Baca KONTEKS SPESIFIK YANG DITEMUKAN di bawah. Ini adalah informasi yang paling relevan untuk pertanyaan saat ini.
+    3. Jawab PERTANYAAN PENGGUNA secara analitis. Sintesiskan informasi dari KONTEKS SPESIFIK, tetapi selalu interpretasikan melalui lensa META-KONTEKS.
+    4. Anda WAJIB menjawab HANYA berdasarkan informasi yang disediakan. JANGAN gunakan pengetahuan eksternal.
+    5. Jika informasi tidak ada di dalam KONTEKS SPESIFIK, jawab secara eksplisit: "Informasi untuk menjawab pertanyaan ini tidak ditemukan secara spesifik dalam dokumen yang relevan, namun secara umum, seluruh korpus ini membahas desa wisata."
+    6. Sebutkan ID Dokumen untuk setiap klaim spesifik yang Anda buat.
+
+    =========================
+    KONTEKS SPESIFIK YANG DITEMUKAN:
     {context_text}
+    =========================
 
     PERTANYAAN PENGGUNA:
     {query}
 
-    JAWABAN AKURAT ANDA:
+    JAWABAN ANALITIS ANDA:
     """
     
     try:
@@ -123,7 +128,6 @@ def generate_narrative_answer(query, context_df):
 # BAGIAN 2: ALUR UTAMA APLIKASI
 # ==============================================================================
 
-# --- Sidebar untuk Opsi Lanjutan ---
 st.sidebar.header("Pengaturan Lanjutan")
 relevance_threshold = st.sidebar.slider(
     "Ambang Batas Relevansi (Relevance Threshold)", 
@@ -131,12 +135,10 @@ relevance_threshold = st.sidebar.slider(
     help="Hanya dokumen dengan skor kemiripan di atas ambang ini yang akan digunakan sebagai konteks. Tingkatkan jika hasilnya terlalu umum, turunkan jika tidak ada hasil yang ditemukan."
 )
 
-# --- Memuat Data dan Model ---
 df_corpus, df_anchors = load_data()
 
 if df_corpus is not None and df_anchors is not None:
     embedding_model = load_embedding_model()
-    # Menampilkan pesan status saat proses embedding
     with st.spinner("Mempersiapkan basis pengetahuan... (hanya saat pertama kali dimuat)"):
         knowledge_base, corpus_embeddings = prepare_and_embed_knowledge_base(df_corpus, df_anchors, embedding_model)
     st.success("Basis pengetahuan siap.")
