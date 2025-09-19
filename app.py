@@ -1,5 +1,6 @@
 # app.py
 
+import re
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -32,6 +33,20 @@ def load_data():
 def load_embedding_model():
     return SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
 
+def _prefer_id(row):
+    """Pilih ID yang sah dengan prioritas: rrn > anchor_id > doc_id numerik; selain itu kembalikan None."""
+    rrn = str(row.get('rrn', '')).strip()
+    if rrn:
+        return rrn  # gunakan persis apa adanya (mis. RRN039)
+    anc = str(row.get('anchor_id', '')).strip()
+    if anc:
+        return anc  # mis. GA-025
+    doc = row.get('doc_id', np.nan)
+    doc_num = pd.to_numeric(doc, errors='coerce')
+    if pd.notna(doc_num):
+        return f"RRN{int(doc_num):03d}"
+    return None  # tidak ada ID sah
+
 @st.cache_data(show_spinner=False)
 def prepare_and_embed_knowledge_base(_corpus_db, _anchors_db):
     st.info("Mempersiapkan basis pengetahuan...")
@@ -43,12 +58,12 @@ def prepare_and_embed_knowledge_base(_corpus_db, _anchors_db):
 
     # Siapkan kolom agar tidak KeyError bila ada yang hilang
     corpus_copy = _corpus_db.copy()
-    for c in corpus_cols + ['doc_id','rrn','citation_full']:
+    for c in corpus_cols + ['doc_id','rrn','citation_full','anchor_id']:
         if c not in corpus_copy.columns:
             corpus_copy[c] = ''
 
     anchors_copy = _anchors_db.copy()
-    for c in anchor_cols + ['anchor_id','citation_full']:
+    for c in anchor_cols + ['anchor_id','citation_full','rrn','doc_id']:
         if c not in anchors_copy.columns:
             anchors_copy[c] = ''
 
@@ -57,27 +72,17 @@ def prepare_and_embed_knowledge_base(_corpus_db, _anchors_db):
     anchors_copy['text_for_embedding'] = anchors_copy[anchor_cols].fillna('').agg(' '.join, axis=1)
 
     combined_db = pd.concat([
-        corpus_copy[['doc_id','rrn','citation_full','text_for_embedding']],
-        anchors_copy[['anchor_id','citation_full','text_for_embedding']]
+        corpus_copy[['doc_id','rrn','anchor_id','citation_full','text_for_embedding']],
+        anchors_copy[['doc_id','rrn','anchor_id','citation_full','text_for_embedding']]
     ], ignore_index=True, sort=False)
 
-    # unique_id yang robust
-    def _make_uid(row):
-        doc = row.get('doc_id', np.nan)
-        anc = row.get('anchor_id', np.nan)
-        doc_num = pd.to_numeric(doc, errors='coerce')
-        if pd.notna(doc_num):
-            return f"RRN{int(doc_num):03d}"
-        if pd.notna(anc):
-            return str(anc).strip()
-        return f"UNK_{row.name}"
-
-    combined_db['unique_id'] = combined_db.apply(_make_uid, axis=1)
-
-    # Bersihkan baris kosong dan duplikat
-    knowledge_base = combined_db.dropna(subset=['text_for_embedding']).copy()
+    # Tentukan unique_id dari prioritas yg sah; buang entri tanpa ID
+    combined_db['unique_id'] = combined_db.apply(_prefer_id, axis=1)
+    knowledge_base = combined_db.dropna(subset=['text_for_embedding', 'unique_id']).copy()
     knowledge_base = knowledge_base[knowledge_base['text_for_embedding'].str.strip().ne('')].copy()
     knowledge_base['citation_full'] = knowledge_base['citation_full'].fillna('—')
+
+    # Jaga keunikan berdasarkan unique_id; jika duplikat, ambil baris pertama
     knowledge_base.drop_duplicates(subset=['unique_id'], inplace=True)
 
     st.success(f"Basis pengetahuan dengan {len(knowledge_base)} entri berhasil disiapkan.")
@@ -116,6 +121,14 @@ def retrieve_semantic_context(query, knowledge_base_df, embeddings_matrix, model
     retrieved_df['similarity_score'] = similarities[final_indices]
     return retrieved_df
 
+def _build_allowlist(context_df):
+    """Kembalikan daftar ID sah (allow-list) yang boleh dipakai LLM."""
+    ids = context_df['unique_id'].astype(str).tolist()
+    return ids
+
+def _format_allowlist_md(ids):
+    return ", ".join(f"`{i}`" for i in ids)
+
 def generate_narrative_answer(query, context_df):
     if context_df.empty:
         return "**Saya tidak menemukan informasi yang cukup relevan di dalam basis data untuk menjawab pertanyaan ini.**\n\n*Saran: Coba turunkan 'Ambang Batas Relevansi' di bilah sisi atau ajukan pertanyaan yang berbeda.*"
@@ -130,16 +143,19 @@ def generate_narrative_answer(query, context_df):
 
     model = genai.GenerativeModel('gemini-2.5-flash')
 
-    # Meta-konteks umum (tanpa angka tetap)
-    meta_context_text = """
-    Seluruh basis data yang digunakan sebagai sumber pengetahuan berasal dari sebuah scoping review sistematis (2015–2025) tentang 'Desa Wisata'.
-    Semua dokumen di dalamnya telah melalui proses penyaringan dengan kriteria inklusi yang berfokus pada 'tourism village',
-    'community-based tourism' pada skala desa, atau 'village-level rural tourism'.
-    Oleh karena itu, Anda harus mengasumsikan bahwa semua informasi yang diberikan sudah berada dalam konteks 'desa wisata'.
-    """
+    # Meta-konteks umum
+    meta_context_text = (
+        "Seluruh basis data berasal dari scoping review sistematis (2015–2025) tentang 'Desa Wisata'. "
+        "Semua dokumen telah disaring dengan kriteria inklusi yang berfokus pada 'tourism village', "
+        "'community-based tourism' pada skala desa, atau 'village-level rural tourism'. "
+        "Jawablah hanya berdasarkan potongan konteks yang diberikan."
+    )
 
-    # Susun konteks yang dioper ke LLM
-    context_lines = ["Berikut adalah potongan-potongan informasi paling relevan untuk pertanyaan ini:\n"]
+    # Susun konteks + allow-list ID
+    allow_ids = _build_allowlist(context_df)
+    allow_ids_md = _format_allowlist_md(allow_ids)
+
+    context_lines = ["Berikut potongan informasi paling relevan untuk pertanyaan ini:\n"]
     for _, row in context_df.iterrows():
         snippet = (row['text_for_embedding'] or "")[:1500]
         context_lines.append(
@@ -149,34 +165,69 @@ def generate_narrative_answer(query, context_df):
         )
     context_text = "\n".join(context_lines)
 
+    # Instruksi tegas: hanya boleh pakai ID pada allow-list
     prompt = f"""
-PERAN: Anda adalah asisten riset ahli yang sangat teliti.
+PERAN: Anda adalah asisten riset yang teliti dan ketat pada sumber.
 
-META-KONTEKS KESELURUHAN:
+META-KONTEKS:
 {meta_context_text}
 
-TUGAS ANDA:
-1. Baca dan pahami META-KONTEKS di atas (berlaku untuk semua pertanyaan).
-2. Baca KONTEKS SPESIFIK berikut (informasi paling relevan untuk pertanyaan saat ini).
-3. Jawab PERTANYAAN PENGGUNA secara analitis. Sintesiskan informasi dari KONTEKS SPESIFIK, dan interpretasikan melalui lensa META-KONTEKS.
-4. WAJIB menjawab HANYA berdasarkan informasi yang disediakan. JANGAN gunakan pengetahuan eksternal.
-5. Jika informasi tidak ada di KONTEKS SPESIFIK, jawab eksplisit: "Informasi untuk menjawab pertanyaan ini tidak ditemukan secara spesifik dalam dokumen yang relevan, namun secara umum, seluruh korpus ini membahas desa wisata."
-6. Sebutkan ID Dokumen untuk setiap klaim spesifik yang Anda buat.
-
-=========================
-KONTEKS SPESIFIK YANG DITEMUKAN:
+KONTEKS SPESIFIK:
 {context_text}
-=========================
+
+ATURAN KUTIPAN (WAJIB DIIKUTI):
+- Gunakan **hanya** ID berikut saat menyebut sumber: {allow_ids_md}
+- Format sitasi **wajib**: tulis di akhir kalimat klaim spesifik dengan tanda kurung siku, misal: [RRN039] atau [GA-025; RRN014]
+- **Dilarang keras** membuat ID baru (contoh yang dilarang: X01, X02, X04, P1–P8, dsb.)
+- Jika ragu memilih ID, pilih yang paling relevan dari daftar di atas; jika perlu, cantumkan dua atau tiga ID sekaligus dalam satu bracket.
+
+CONTOH BENAR:
+- "Keterlibatan perempuan meningkat pada fase pascapelatihan." [RRN039]
+- "Tipologi berbasis aset lokal dan tata kelola ko-produksi ditemukan di sejumlah studi." [RRN012; GA-027]
+
+CONTOH SALAH (JANGAN DITIRU):
+- "...(lihat X01, X02)" ← SALAH karena ID tidak ada di daftar.
+- "...(menurut dokumen 3)" ← SALAH karena tidak sesuai format.
+
+TUGAS:
+1) Jawab pertanyaan pengguna di bawah ini secara analitis dan ringkas.
+2) Setiap klaim spesifik harus diakhiri sitasi [ID] yang **hanya** berasal dari daftar di atas.
+3) Jangan gunakan pengetahuan di luar konteks yang diberikan.
 
 PERTANYAAN PENGGUNA:
 {query}
 
-JAWABAN ANALITIS ANDA:
+JAWABAN:
 """.strip()
 
     try:
         response = model.generate_content(prompt)
-        return response.text
+        answer = response.text or ""
+
+        # Validasi ringan di sisi aplikasi:
+        # Ambil semua token di dalam [ ... ] dan pastikan masuk allow-list
+        cited_tokens = []
+        for match in re.findall(r"\[([^\]]+)\]", answer):
+            parts = re.split(r"[;,]", match)
+            for p in parts:
+                token = p.strip()
+                if token:
+                    cited_tokens.append(token)
+
+        unknown = [t for t in cited_tokens if t not in allow_ids]
+        if unknown:
+            # Tidak memodifikasi isi klaim; hanya beri catatan agar transparan
+            warn = (
+                "\n\n> **Catatan validasi**: Ditemukan ID yang tidak ada di daftar sumber konteks: "
+                + ", ".join(f"`{u}`" for u in unknown)
+                + ". Mohon sesuaikan dengan ID yang diizinkan di atas."
+            )
+            answer = answer + warn
+
+        # Tambahkan ringkas daftar sumber yang memang diberikan sebagai konteks
+        footer = "\n\n---\n**Sumber konteks (ID tersedia untuk jawaban ini):** " + ", ".join(f"`{i}`" for i in allow_ids)
+        return answer + footer
+
     except Exception as e:
         st.error(f"Terjadi kesalahan saat menghubungi API Gemini: {e}")
         return None
@@ -191,6 +242,11 @@ relevance_threshold = st.sidebar.slider(
     "Ambang Batas Relevansi (Relevance Threshold)",
     min_value=0.0, max_value=1.0, value=0.55, step=0.05,
     help="Hanya dokumen dengan skor kemiripan di atas ambang ini yang akan digunakan sebagai konteks. Tingkatkan jika hasilnya terlalu umum, turunkan jika tidak ada hasil yang ditemukan."
+)
+top_k = st.sidebar.slider(
+    "Top-K dokumen",
+    min_value=3, max_value=20, value=5, step=1,
+    help="Jumlah dokumen teratas yang dipakai sebagai konteks."
 )
 
 # Memuat data & model
@@ -218,6 +274,7 @@ if df_corpus is not None and df_anchors is not None:
                     knowledge_base,
                     corpus_embeddings,
                     embedding_model,
+                    top_n=top_k,
                     threshold=relevance_threshold
                 )
 
