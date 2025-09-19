@@ -13,10 +13,9 @@ st.title("🤖 Asisten Riset untuk Scoping Review 'Desa Wisata'")
 st.write("Sistem ini menggunakan Retrieval-Augmented Generation (RAG) untuk menjawab pertanyaan hanya berdasarkan korpus riset yang disediakan.")
 
 # ==============================================================================
-# BAGIAN 1: DEFINISI FUNGSI-FUNGSI INTI
+# BAGIAN 1: FUNGSI-FUNGSI INTI
 # ==============================================================================
 
-# Menggunakan cache Streamlit agar data dan model tidak dimuat ulang setiap kali
 @st.cache_data
 def load_data():
     try:
@@ -26,7 +25,7 @@ def load_data():
         df_anchors = pd.read_csv(anchors_path)
         return df_corpus, df_anchors
     except FileNotFoundError:
-        st.error("Pastikan file 'ScR_TV_Corpus.csv' dan 'ScR_TV_Anchors.csv' berada di repositori GitHub Anda.")
+        st.error("Pastikan file 'ScR_TV_Corpus.csv' dan 'ScR_TV_Anchors.csv' berada di direktori utama repositori GitHub Anda.")
         return None, None
 
 @st.cache_resource
@@ -34,7 +33,8 @@ def load_embedding_model():
     return SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
 
 @st.cache_data
-def prepare_knowledge_base(_corpus_db, _anchors_db):
+def prepare_and_embed_knowledge_base(_corpus_db, _anchors_db, _model):
+    # ... (Fungsi ini tetap sama, tidak perlu diubah) ...
     corpus_cols = ['title', 'abstract', 'key_arguments_findings', 'critical_comments_linkages', 'outcome_notes', 'notes']
     anchor_cols = ['citation_full', 'abstract', 'verbatim_definition', 'typology_summary', 'purpose_quote', 'notes']
     corpus_copy = _corpus_db.copy()
@@ -48,13 +48,12 @@ def prepare_knowledge_base(_corpus_db, _anchors_db):
     combined_db['unique_id'] = combined_db.apply(
         lambda row: f"RRN{str(int(row['doc_id'])).zfill(3)}" if pd.notna(row['doc_id']) else row['anchor_id'], axis=1
     )
-    return combined_db.dropna(subset=['text_for_embedding'])
-
-@st.cache_data
-def create_embeddings(_knowledge_base, _model):
-    return _model.encode(_knowledge_base['text_for_embedding'].tolist())
+    knowledge_base = combined_db.dropna(subset=['text_for_embedding'])
+    embeddings = _model.encode(knowledge_base['text_for_embedding'].tolist())
+    return knowledge_base, embeddings
 
 def retrieve_semantic_context(query, knowledge_base_df, embeddings_matrix, model, top_n=5):
+    # ... (Fungsi ini tetap sama, tidak perlu diubah) ...
     query_embedding = model.encode(query)
     similarities = cosine_similarity([query_embedding], embeddings_matrix)[0]
     top_n_indices = np.argsort(similarities)[-top_n:][::-1]
@@ -63,7 +62,10 @@ def retrieve_semantic_context(query, knowledge_base_df, embeddings_matrix, model
     return retrieved_df
 
 def generate_narrative_answer(query, context_df):
-    # Konfigurasi API Key dari Streamlit Secrets
+    # --- PAGAR PENGAMAN #1: Periksa jika konteks kosong ---
+    if context_df.empty:
+        return "Saya tidak menemukan informasi yang cukup relevan di dalam basis data untuk menjawab pertanyaan ini. Silakan coba ajukan pertanyaan yang berbeda."
+
     try:
         GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
         genai.configure(api_key=GOOGLE_API_KEY)
@@ -72,14 +74,29 @@ def generate_narrative_answer(query, context_df):
         return None
 
     model = genai.GenerativeModel('gemini-2.5-flash')
-    context_text = ""
+    context_text = "Berikut adalah potongan-potongan informasi relevan dari basis data riset:\n\n"
     for index, row in context_df.iterrows():
-        context_text += f"--- Dokumen (ID: {row['unique_id']}) ---\nSitasi: {row['citation_full']}\nKutipan Relevan: {row['text_for_embedding'][:1000]}...\n\n"
+        context_text += f"--- Dokumen (ID: {row['unique_id']}) ---\nSitasi: {row['citation_full']}\nKutipan Relevan: {row['text_for_embedding'][:1500]}...\n\n"
     
+    # --- PAGAR PENGAMAN #2: Prompt yang lebih ketat ---
     prompt = f"""
-    Anda adalah seorang asisten riset ahli. JAWAB PERTANYAAN BERIKUT HANYA BERDASARKAN "KONTEKS" YANG DIBERIKAN.
-    Jangan gunakan pengetahuan eksternal. Sebutkan sumber dengan merujuk pada ID Dokumen yang relevan.
-    KONTEKS:\n{context_text}\nPERTANYAAN PENGGUNA:\n{query}\n\nJAWABAN AKURAT ANDA:"""
+    Anda adalah seorang asisten riset ahli yang sangat teliti.
+    Tugas Anda adalah menjawab pertanyaan pengguna secara ringkas dan akurat.
+    JAWAB PERTANYAAN BERIKUT HANYA DAN EKSKLUSIF BERDASARKAN "KONTEKS" YANG DIBERIKAN.
+    JANGAN berspekulasi, menambahkan informasi, atau menggunakan pengetahuan eksternal apa pun.
+    Jika informasi untuk menjawab pertanyaan tidak ada di dalam KONTEKS, Anda WAJIB menjawab: "Informasi untuk menjawab pertanyaan ini tidak ditemukan dalam dokumen yang relevan."
+    Untuk setiap klaim yang Anda buat, sebutkan sumbernya dengan merujuk pada ID Dokumen yang relevan.
+
+    =========================
+    KONTEKS:
+    {context_text}
+    =========================
+
+    PERTANYAAN PENGGUNA:
+    {query}
+
+    JAWABAN AKURAT ANDA:
+    """
     
     try:
         response = model.generate_content(prompt)
@@ -89,29 +106,30 @@ def generate_narrative_answer(query, context_df):
         return None
 
 # ==============================================================================
-# BAGIAN 2: INISIALISASI DATA & ANTARMUKA UTAMA
+# BAGIAN 2: ALUR UTAMA APLIKASI
 # ==============================================================================
 
 df_corpus, df_anchors = load_data()
 
-# Hanya jalankan sisa aplikasi jika data berhasil dimuat
 if df_corpus is not None and df_anchors is not None:
     embedding_model = load_embedding_model()
-    knowledge_base = prepare_knowledge_base(df_corpus, df_anchors)
-    corpus_embeddings = create_embeddings(knowledge_base, embedding_model)
+    # Menampilkan pesan status saat proses embedding
+    with st.spinner("Mempersiapkan basis pengetahuan dan embeddings... (mungkin butuh beberapa saat saat pertama kali dimuat)"):
+        knowledge_base, corpus_embeddings = prepare_and_embed_knowledge_base(df_corpus, df_anchors, embedding_model)
+    st.success("Basis pengetahuan siap.")
 
     st.header("Ajukan Pertanyaan Riset Anda")
-    user_query = st.text_input("Masukkan pertanyaan Anda tentang tata kelola, pemerataan manfaat, atau faktor keberhasilan CBT:", "Apa saja faktor kunci keberhasilan untuk pariwisata berbasis komunitas (CBT) menurut literatur?")
+    user_query = st.text_input("Masukkan pertanyaan Anda tentang tata kelola, pemerataan manfaat, atau faktor keberhasilan CBT:", "Jelaskan berbagai tipologi desa wisata yang ada dalam korpus.")
 
     if st.button("Cari Jawaban"):
         if user_query:
-            with st.spinner("Mencari dokumen relevan..."):
+            with st.spinner("Langkah 1: Mencari dokumen relevan..."):
                 retrieved_df = retrieve_semantic_context(user_query, knowledge_base, corpus_embeddings, embedding_model)
 
             with st.expander("Lihat Dokumen yang Paling Relevan (Konteks untuk AI)"):
                 st.dataframe(retrieved_df[['unique_id', 'citation_full', 'similarity_score']])
 
-            with st.spinner("Menyusun jawaban dengan Gemini 2.5 Flash..."):
+            with st.spinner("Langkah 2: Menyusun jawaban dengan Gemini 2.5 Flash..."):
                 final_answer = generate_narrative_answer(user_query, retrieved_df)
                 if final_answer:
                     st.markdown("---")
