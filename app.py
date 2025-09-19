@@ -32,40 +32,79 @@ def load_data():
 def load_embedding_model():
     return SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
 
-@st.cache_data
-def prepare_and_embed_knowledge_base(_corpus_db, _anchors_db, _model):
-    # ... (Fungsi ini tetap sama) ...
-    corpus_cols = ['title', 'abstract', 'key_arguments_findings', 'critical_comments_linkages', 'outcome_notes', 'notes']
-    anchor_cols = ['citation_full', 'abstract', 'verbatim_definition', 'typology_summary', 'purpose_quote', 'notes']
+@st.cache_data(show_spinner=False)
+def prepare_and_embed_knowledge_base(_corpus_db, _anchors_db):
+    st.info("Mempersiapkan basis pengetahuan...")
+
+    corpus_cols = ['title','abstract','key_arguments_findings',
+                   'critical_comments_linkages','outcome_notes','notes']
+    anchor_cols = ['citation_full','abstract','verbatim_definition',
+                   'typology_summary','purpose_quote','notes']
+
     corpus_copy = _corpus_db.copy()
+    for c in corpus_cols + ['doc_id','rrn','citation_full']:
+        if c not in corpus_copy.columns:
+            corpus_copy[c] = ''
+
     anchors_copy = _anchors_db.copy()
+    for c in anchor_cols + ['anchor_id','citation_full']:
+        if c not in anchors_copy.columns:
+            anchors_copy[c] = ''
+
     corpus_copy['text_for_embedding'] = corpus_copy[corpus_cols].fillna('').agg(' '.join, axis=1)
     anchors_copy['text_for_embedding'] = anchors_copy[anchor_cols].fillna('').agg(' '.join, axis=1)
+
     combined_db = pd.concat([
-        corpus_copy[['doc_id', 'rrn', 'citation_full', 'text_for_embedding']],
-        anchors_copy[['anchor_id', 'citation_full', 'text_for_embedding']]
-    ], ignore_index=True)
-    combined_db['unique_id'] = combined_db.apply(
-        lambda row: f"RRN{str(int(row['doc_id'])).zfill(3)}" if pd.notna(row['doc_id']) else row['anchor_id'], axis=1
+        corpus_copy[['doc_id','rrn','citation_full','text_for_embedding']],
+        anchors_copy[['anchor_id','citation_full','text_for_embedding']]
+    ], ignore_index=True, sort=False)
+
+    def _make_uid(row):
+        doc = row.get('doc_id', np.nan)
+        anc = row.get('anchor_id', np.nan)
+        doc_num = pd.to_numeric(doc, errors='coerce')
+        if pd.notna(doc_num):
+            return f"RRN{int(doc_num):03d}"
+        if pd.notna(anc):
+            return str(anc).strip()
+        return f"UNK_{row.name}"
+
+    combined_db['unique_id'] = combined_db.apply(_make_uid, axis=1)
+
+    knowledge_base = combined_db.dropna(subset=['text_for_embedding']).copy()
+    knowledge_base = knowledge_base[knowledge_base['text_for_embedding'].str.strip().ne('')].copy()
+    knowledge_base['citation_full'] = knowledge_base['citation_full'].fillna('—')
+    knowledge_base.drop_duplicates(subset=['unique_id'], inplace=True)
+
+    st.success(f"Basis pengetahuan dengan {len(knowledge_base)} entri berhasil disiapkan.")
+
+    st.info("Membuat embeddings (representasi numerik)...")
+    embedding_model = load_embedding_model()
+    embeddings = embedding_model.encode(
+        knowledge_base['text_for_embedding'].tolist()
     )
-    knowledge_base = combined_db.dropna(subset=['text_for_embedding'])
-    embeddings = _model.encode(knowledge_base['text_for_embedding'].tolist())
+    embeddings = np.asarray(embeddings, dtype=np.float32)
+    st.success(f"Berhasil membuat {len(embeddings)} embeddings.")
+
     return knowledge_base, embeddings
 
 def retrieve_semantic_context(query, knowledge_base_df, embeddings_matrix, model, top_n=5, threshold=0.5):
-    # ... (Fungsi ini tetap sama) ...
     query_embedding = model.encode(query)
     similarities = cosine_similarity([query_embedding], embeddings_matrix)[0]
+
     all_indices = np.argsort(similarities)[::-1]
     all_scores = similarities[all_indices]
-    relevant_indices = all_indices[all_scores > threshold]
-    relevant_scores = all_scores[all_scores > threshold]
+
+    relevant_mask = all_scores > threshold
+    relevant_indices = all_indices[relevant_mask]
     final_indices = relevant_indices[:top_n]
-    final_scores = relevant_scores[:top_n]
+
     if len(final_indices) == 0:
-        return pd.DataFrame()
+        # fallback: ambil TOP-N teratas tanpa threshold
+        final_indices = all_indices[:min(top_n, len(all_indices))]
+
     retrieved_df = knowledge_base_df.iloc[final_indices].copy()
-    retrieved_df['similarity_score'] = final_scores
+    retrieved_df['similarity_score'] = similarities[final_indices]
     return retrieved_df
 
 def generate_narrative_answer(query, context_df):
@@ -175,3 +214,4 @@ if df_corpus is not None and df_anchors is not None:
                     st.markdown(final_answer)
         else:
             st.warning("Harap masukkan pertanyaan.")
+
