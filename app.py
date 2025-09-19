@@ -12,14 +12,16 @@ st.set_page_config(page_title="Asisten Riset Desa Wisata", layout="wide")
 st.title("🤖 Asisten Riset untuk Scoping Review 'Desa Wisata'")
 st.write("Sistem ini menggunakan Retrieval-Augmented Generation (RAG) untuk menjawab pertanyaan hanya berdasarkan korpus riset yang disediakan.")
 
-# --- Fungsi-fungsi Inti (dari Colab, sedikit dimodifikasi untuk cache) ---
+# ==============================================================================
+# BAGIAN 1: DEFINISI FUNGSI-FUNGSI INTI
+# ==============================================================================
 
 # Menggunakan cache Streamlit agar data dan model tidak dimuat ulang setiap kali
 @st.cache_data
 def load_data():
     try:
-        corpus_path = 'ScR_TV_Corpus.csv'  # Pastikan file ini ada di repo GitHub Anda
-        anchors_path = 'ScR_TV_Anchors.csv' # Pastikan file ini ada di repo GitHub Anda
+        corpus_path = 'ScR_TV_Corpus.csv'
+        anchors_path = 'ScR_TV_Anchors.csv'
         df_corpus = pd.read_csv(corpus_path)
         df_anchors = pd.read_csv(anchors_path)
         return df_corpus, df_anchors
@@ -52,44 +54,6 @@ def prepare_knowledge_base(_corpus_db, _anchors_db):
 def create_embeddings(_knowledge_base, _model):
     return _model.encode(_knowledge_base['text_for_embedding'].tolist())
 
-# --- Inisialisasi Data & Model ---
-df_corpus, df_anchors = load_data()
-if df_corpus is not None:
-    embedding_model = load_embedding_model()
-    knowledge_base = prepare_knowledge_base(df_corpus, df_anchors)
-    corpus_embeddings = create_embeddings(knowledge_base, embedding_model)
-
-    # --- Antarmuka Pengguna (UI) ---
-    st.header("Ajukan Pertanyaan Riset Anda")
-    user_query = st.text_input("Masukkan pertanyaan Anda tentang tata kelola, pemerataan manfaat, atau faktor keberhasilan CBT:", "Apa saja faktor kunci keberhasilan untuk pariwisata berbasis komunitas (CBT) menurut literatur?")
-
-    if st.button("Cari Jawaban"):
-        if user_query:
-            # Konfigurasi API Key dari Streamlit Secrets
-            try:
-                GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
-                genai.configure(api_key=GOOGLE_API_KEY)
-            except:
-                st.error("Harap konfigurasikan GOOGLE_API_KEY Anda di Streamlit Secrets.")
-                st.stop()
-
-            with st.spinner("Mencari dokumen relevan..."):
-                # Langkah 2: Retrieve
-                retrieved_df = retrieve_semantic_context(user_query, knowledge_base, corpus_embeddings, embedding_model)
-
-            with st.expander("Lihat Dokumen yang Paling Relevan (Konteks untuk AI)"):
-                st.dataframe(retrieved_df[['unique_id', 'citation_full', 'similarity_score']])
-
-            with st.spinner("Menyusun jawaban dengan Gemini 2.5 Flash..."):
-                # Langkah 3: Generate
-                final_answer = generate_narrative_answer(user_query, retrieved_df)
-                st.markdown("---")
-                st.subheader("Jawaban dari Asisten Riset:")
-                st.markdown(final_answer)
-        else:
-            st.warning("Harap masukkan pertanyaan.")
-
-# --- Fungsi yang Dipanggil (dari Colab) ---
 def retrieve_semantic_context(query, knowledge_base_df, embeddings_matrix, model, top_n=5):
     query_embedding = model.encode(query)
     similarities = cosine_similarity([query_embedding], embeddings_matrix)[0]
@@ -99,6 +63,14 @@ def retrieve_semantic_context(query, knowledge_base_df, embeddings_matrix, model
     return retrieved_df
 
 def generate_narrative_answer(query, context_df):
+    # Konfigurasi API Key dari Streamlit Secrets
+    try:
+        GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
+        genai.configure(api_key=GOOGLE_API_KEY)
+    except Exception as e:
+        st.error(f"Harap konfigurasikan GOOGLE_API_KEY Anda di Streamlit Secrets. Error: {e}")
+        return None
+
     model = genai.GenerativeModel('gemini-2.5-flash')
     context_text = ""
     for index, row in context_df.iterrows():
@@ -109,5 +81,41 @@ def generate_narrative_answer(query, context_df):
     Jangan gunakan pengetahuan eksternal. Sebutkan sumber dengan merujuk pada ID Dokumen yang relevan.
     KONTEKS:\n{context_text}\nPERTANYAAN PENGGUNA:\n{query}\n\nJAWABAN AKURAT ANDA:"""
     
-    response = model.generate_content(prompt)
-    return response.text
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        st.error(f"Terjadi kesalahan saat menghubungi API Gemini: {e}")
+        return None
+
+# ==============================================================================
+# BAGIAN 2: INISIALISASI DATA & ANTARMUKA UTAMA
+# ==============================================================================
+
+df_corpus, df_anchors = load_data()
+
+# Hanya jalankan sisa aplikasi jika data berhasil dimuat
+if df_corpus is not None and df_anchors is not None:
+    embedding_model = load_embedding_model()
+    knowledge_base = prepare_knowledge_base(df_corpus, df_anchors)
+    corpus_embeddings = create_embeddings(knowledge_base, embedding_model)
+
+    st.header("Ajukan Pertanyaan Riset Anda")
+    user_query = st.text_input("Masukkan pertanyaan Anda tentang tata kelola, pemerataan manfaat, atau faktor keberhasilan CBT:", "Apa saja faktor kunci keberhasilan untuk pariwisata berbasis komunitas (CBT) menurut literatur?")
+
+    if st.button("Cari Jawaban"):
+        if user_query:
+            with st.spinner("Mencari dokumen relevan..."):
+                retrieved_df = retrieve_semantic_context(user_query, knowledge_base, corpus_embeddings, embedding_model)
+
+            with st.expander("Lihat Dokumen yang Paling Relevan (Konteks untuk AI)"):
+                st.dataframe(retrieved_df[['unique_id', 'citation_full', 'similarity_score']])
+
+            with st.spinner("Menyusun jawaban dengan Gemini 2.5 Flash..."):
+                final_answer = generate_narrative_answer(user_query, retrieved_df)
+                if final_answer:
+                    st.markdown("---")
+                    st.subheader("Jawaban dari Asisten Riset:")
+                    st.markdown(final_answer)
+        else:
+            st.warning("Harap masukkan pertanyaan.")
