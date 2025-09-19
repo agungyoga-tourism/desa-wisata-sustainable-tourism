@@ -34,7 +34,7 @@ def load_embedding_model():
 
 @st.cache_data
 def prepare_and_embed_knowledge_base(_corpus_db, _anchors_db, _model):
-    # ... (Fungsi ini tetap sama, tidak perlu diubah) ...
+    # ... (Fungsi ini tetap sama) ...
     corpus_cols = ['title', 'abstract', 'key_arguments_findings', 'critical_comments_linkages', 'outcome_notes', 'notes']
     anchor_cols = ['citation_full', 'abstract', 'verbatim_definition', 'typology_summary', 'purpose_quote', 'notes']
     corpus_copy = _corpus_db.copy()
@@ -52,19 +52,35 @@ def prepare_and_embed_knowledge_base(_corpus_db, _anchors_db, _model):
     embeddings = _model.encode(knowledge_base['text_for_embedding'].tolist())
     return knowledge_base, embeddings
 
-def retrieve_semantic_context(query, knowledge_base_df, embeddings_matrix, model, top_n=5):
-    # ... (Fungsi ini tetap sama, tidak perlu diubah) ...
+def retrieve_semantic_context(query, knowledge_base_df, embeddings_matrix, model, top_n=5, threshold=0.5):
+    """
+    Fungsi ini sekarang memiliki ambang batas relevansi.
+    """
     query_embedding = model.encode(query)
     similarities = cosine_similarity([query_embedding], embeddings_matrix)[0]
-    top_n_indices = np.argsort(similarities)[-top_n:][::-1]
-    retrieved_df = knowledge_base_df.iloc[top_n_indices].copy()
-    retrieved_df['similarity_score'] = similarities[top_n_indices]
+    
+    # Ambil indeks dan skor dari semua dokumen
+    all_indices = np.argsort(similarities)[::-1]
+    all_scores = similarities[all_indices]
+    
+    # --- FILTER BERDASARKAN AMBANG BATAS ---
+    relevant_indices = all_indices[all_scores > threshold]
+    relevant_scores = all_scores[all_scores > threshold]
+    
+    # Ambil hanya top_n dari hasil yang sudah difilter
+    final_indices = relevant_indices[:top_n]
+    final_scores = relevant_scores[:top_n]
+    
+    if len(final_indices) == 0:
+        return pd.DataFrame() # Kembalikan DataFrame kosong jika tidak ada yang relevan
+        
+    retrieved_df = knowledge_base_df.iloc[final_indices].copy()
+    retrieved_df['similarity_score'] = final_scores
     return retrieved_df
 
 def generate_narrative_answer(query, context_df):
-    # --- PAGAR PENGAMAN #1: Periksa jika konteks kosong ---
     if context_df.empty:
-        return "Saya tidak menemukan informasi yang cukup relevan di dalam basis data untuk menjawab pertanyaan ini. Silakan coba ajukan pertanyaan yang berbeda."
+        return "**Saya tidak menemukan informasi yang cukup relevan di dalam basis data untuk menjawab pertanyaan ini.**\n\n*Saran: Coba ajukan pertanyaan yang lebih umum atau gunakan kata kunci yang berbeda yang mungkin ada di dalam teks abstrak atau temuan dari korpus riset Anda.*"
 
     try:
         GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
@@ -78,7 +94,6 @@ def generate_narrative_answer(query, context_df):
     for index, row in context_df.iterrows():
         context_text += f"--- Dokumen (ID: {row['unique_id']}) ---\nSitasi: {row['citation_full']}\nKutipan Relevan: {row['text_for_embedding'][:1500]}...\n\n"
     
-    # --- PAGAR PENGAMAN #2: Prompt yang lebih ketat ---
     prompt = f"""
     Anda adalah seorang asisten riset ahli yang sangat teliti.
     Tugas Anda adalah menjawab pertanyaan pengguna secara ringkas dan akurat.
@@ -113,8 +128,7 @@ df_corpus, df_anchors = load_data()
 
 if df_corpus is not None and df_anchors is not None:
     embedding_model = load_embedding_model()
-    # Menampilkan pesan status saat proses embedding
-    with st.spinner("Mempersiapkan basis pengetahuan dan embeddings... (mungkin butuh beberapa saat saat pertama kali dimuat)"):
+    with st.spinner("Mempersiapkan basis pengetahuan... (hanya saat pertama kali dimuat)"):
         knowledge_base, corpus_embeddings = prepare_and_embed_knowledge_base(df_corpus, df_anchors, embedding_model)
     st.success("Basis pengetahuan siap.")
 
@@ -127,7 +141,10 @@ if df_corpus is not None and df_anchors is not None:
                 retrieved_df = retrieve_semantic_context(user_query, knowledge_base, corpus_embeddings, embedding_model)
 
             with st.expander("Lihat Dokumen yang Paling Relevan (Konteks untuk AI)"):
-                st.dataframe(retrieved_df[['unique_id', 'citation_full', 'similarity_score']])
+                if retrieved_df.empty:
+                    st.warning("Tidak ada dokumen yang ditemukan di atas ambang batas relevansi (skor > 0.5).")
+                else:
+                    st.dataframe(retrieved_df[['unique_id', 'citation_full', 'similarity_score']])
 
             with st.spinner("Langkah 2: Menyusun jawaban dengan Gemini 2.5 Flash..."):
                 final_answer = generate_narrative_answer(user_query, retrieved_df)
