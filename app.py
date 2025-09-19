@@ -33,18 +33,35 @@ def load_data():
 def load_embedding_model():
     return SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
 
-def _prefer_id(row):
-    """Pilih ID yang sah dengan prioritas: rrn > anchor_id > doc_id numerik; selain itu kembalikan None."""
-    rrn = str(row.get('rrn', '')).strip()
-    if rrn:
-        return rrn  # gunakan persis apa adanya (mis. RRN039)
-    anc = str(row.get('anchor_id', '')).strip()
-    if anc:
-        return anc  # mis. GA-025
+# ---- Validasi pola ID yang diperbolehkan ----
+ID_PATTERN = re.compile(r"(?:RRN\d{3}|GA-\d{3})$")
+
+def _is_allowed_id(x: str) -> bool:
+    if not isinstance(x, str):
+        return False
+    return bool(ID_PATTERN.fullmatch(x.strip().upper()))
+
+def _normalize_id(x: str) -> str:
+    return x.strip().upper()
+
+def _choose_unique_id(row):
+    """
+    Prioritas ID sah: RRN### (kolom rrn) > GA-### (anchor_id) > doc_id numerik→RRN###.
+    Kembalikan None jika tidak ada ID sah.
+    """
+    rrn = _normalize_id(str(row.get('rrn', '')))
+    if _is_allowed_id(rrn):
+        return rrn
+
+    anc = _normalize_id(str(row.get('anchor_id', '')))
+    if _is_allowed_id(anc):
+        return anc
+
     doc = row.get('doc_id', np.nan)
     doc_num = pd.to_numeric(doc, errors='coerce')
     if pd.notna(doc_num):
         return f"RRN{int(doc_num):03d}"
+
     return None  # tidak ada ID sah
 
 @st.cache_data(show_spinner=False)
@@ -76,18 +93,23 @@ def prepare_and_embed_knowledge_base(_corpus_db, _anchors_db):
         anchors_copy[['doc_id','rrn','anchor_id','citation_full','text_for_embedding']]
     ], ignore_index=True, sort=False)
 
-    # Tentukan unique_id dari prioritas yg sah; buang entri tanpa ID
-    combined_db['unique_id'] = combined_db.apply(_prefer_id, axis=1)
+    # Tentukan unique_id sah
+    combined_db['unique_id'] = combined_db.apply(_choose_unique_id, axis=1)
+
+    # Bersihkan: wajib punya teks dan ID sah
     knowledge_base = combined_db.dropna(subset=['text_for_embedding', 'unique_id']).copy()
     knowledge_base = knowledge_base[knowledge_base['text_for_embedding'].str.strip().ne('')].copy()
     knowledge_base['citation_full'] = knowledge_base['citation_full'].fillna('—')
 
-    # Jaga keunikan berdasarkan unique_id; jika duplikat, ambil baris pertama
+    # Hanya biarkan ID yang lolos pola (hindari X01/X04 dsb.)
+    knowledge_base = knowledge_base[knowledge_base['unique_id'].apply(_is_allowed_id)].copy()
+
+    # Keunikan ID
     knowledge_base.drop_duplicates(subset=['unique_id'], inplace=True)
 
     st.success(f"Basis pengetahuan dengan {len(knowledge_base)} entri berhasil disiapkan.")
 
-    # Buat embeddings (panggil model dari cache_resource DI DALAM fungsi ini)
+    # Buat embeddings
     st.info("Membuat embeddings (representasi numerik)...")
     embedding_model = load_embedding_model()
     embeddings = embedding_model.encode(
@@ -123,11 +145,32 @@ def retrieve_semantic_context(query, knowledge_base_df, embeddings_matrix, model
 
 def _build_allowlist(context_df):
     """Kembalikan daftar ID sah (allow-list) yang boleh dipakai LLM."""
-    ids = context_df['unique_id'].astype(str).tolist()
+    ids = [ _normalize_id(x) for x in context_df['unique_id'].astype(str).tolist() ]
+    # hanya ID sesuai pola
+    ids = [ i for i in ids if _is_allowed_id(i) ]
+    # hilangkan duplikat dengan menjaga urutan
+    ids = list(dict.fromkeys(ids))
     return ids
 
 def _format_allowlist_md(ids):
-    return ", ".join(f"`{i}`" for i in ids)
+    return ", ".join(f"`{i}`" for i in ids) if ids else "—"
+
+def _sanitize_citations(answer_text: str, allow_ids: list[str]) -> str:
+    """
+    Menjaga hanya ID yang ada di allow-list pada setiap tanda kurung [ ... ].
+    Jika semuanya tidak sah, kurung dihapus total.
+    """
+    def repl(m):
+        inside = m.group(1)
+        tokens = [t.strip().upper() for t in re.split(r"[;,]", inside) if t.strip()]
+        kept = [t for t in tokens if t in allow_ids]
+        if kept:
+            # Hilangkan duplikat, pertahankan urutan
+            kept = list(dict.fromkeys(kept))
+            return "[" + "; ".join(kept) + "]"
+        else:
+            return ""  # buang kurung tanpa ID sah
+    return re.sub(r"\[([^\]]+)\]", repl, answer_text)
 
 def generate_narrative_answer(query, context_df):
     if context_df.empty:
@@ -143,11 +186,11 @@ def generate_narrative_answer(query, context_df):
 
     model = genai.GenerativeModel('gemini-2.5-flash')
 
-    # Meta-konteks umum
+    # Meta-konteks
     meta_context_text = (
         "Seluruh basis data berasal dari scoping review sistematis (2015–2025) tentang 'Desa Wisata'. "
-        "Semua dokumen telah disaring dengan kriteria inklusi yang berfokus pada 'tourism village', "
-        "'community-based tourism' pada skala desa, atau 'village-level rural tourism'. "
+        "Semua dokumen telah disaring dengan kriteria inklusi pada 'tourism village', "
+        "'community-based tourism' skala desa, atau 'village-level rural tourism'. "
         "Jawablah hanya berdasarkan potongan konteks yang diberikan."
     )
 
@@ -165,7 +208,7 @@ def generate_narrative_answer(query, context_df):
         )
     context_text = "\n".join(context_lines)
 
-    # Instruksi tegas: hanya boleh pakai ID pada allow-list
+    # Instruksi tegas: hanya boleh pakai ID pada allow-list; token seperti X01/X04 bukan ID
     prompt = f"""
 PERAN: Anda adalah asisten riset yang teliti dan ketat pada sumber.
 
@@ -177,22 +220,24 @@ KONTEKS SPESIFIK:
 
 ATURAN KUTIPAN (WAJIB DIIKUTI):
 - Gunakan **hanya** ID berikut saat menyebut sumber: {allow_ids_md}
-- Format sitasi **wajib**: tulis di akhir kalimat klaim spesifik dengan tanda kurung siku, misal: [RRN039] atau [GA-025; RRN014]
-- **Dilarang keras** membuat ID baru (contoh yang dilarang: X01, X02, X04, P1–P8, dsb.)
-- Jika ragu memilih ID, pilih yang paling relevan dari daftar di atas; jika perlu, cantumkan dua atau tiga ID sekaligus dalam satu bracket.
+- Format sitasi: tulis di akhir kalimat klaim spesifik dengan tanda kurung siku, misal: [RRN039] atau [GA-025; RRN014]
+- **Dilarang keras** membuat ID baru atau memakai token non-ID (contoh: X01, X02, X04, P1–P8, dsb.) sebagai sitasi.
+- Jika ragu memilih ID, pilih yang paling relevan dari daftar di atas; boleh mencantumkan dua atau tiga ID sekaligus dalam satu bracket.
+- Jika tidak ada ID yang cocok, **jangan** menulis bracket.
 
 CONTOH BENAR:
 - "Keterlibatan perempuan meningkat pada fase pascapelatihan." [RRN039]
 - "Tipologi berbasis aset lokal dan tata kelola ko-produksi ditemukan di sejumlah studi." [RRN012; GA-027]
 
 CONTOH SALAH (JANGAN DITIRU):
-- "...(lihat X01, X02)" ← SALAH karena ID tidak ada di daftar.
+- "...(lihat X01, X02)" ← SALAH karena bukan ID sah.
 - "...(menurut dokumen 3)" ← SALAH karena tidak sesuai format.
 
 TUGAS:
 1) Jawab pertanyaan pengguna di bawah ini secara analitis dan ringkas.
-2) Setiap klaim spesifik harus diakhiri sitasi [ID] yang **hanya** berasal dari daftar di atas.
+2) Setiap klaim spesifik diakhiri sitasi [ID] yang **hanya** berasal dari daftar di atas.
 3) Jangan gunakan pengetahuan di luar konteks yang diberikan.
+4) Jangan memunculkan token non-ID (mis. X01/X04) di dalam bracket.
 
 PERTANYAAN PENGGUNA:
 {query}
@@ -202,30 +247,13 @@ JAWABAN:
 
     try:
         response = model.generate_content(prompt)
-        answer = response.text or ""
+        answer = (response.text or "").strip()
 
-        # Validasi ringan di sisi aplikasi:
-        # Ambil semua token di dalam [ ... ] dan pastikan masuk allow-list
-        cited_tokens = []
-        for match in re.findall(r"\[([^\]]+)\]", answer):
-            parts = re.split(r"[;,]", match)
-            for p in parts:
-                token = p.strip()
-                if token:
-                    cited_tokens.append(token)
+        # Sanitasi pasca-generasi: hapus/rapikan bracket yang tidak sesuai allow-list
+        answer = _sanitize_citations(answer, allow_ids)
 
-        unknown = [t for t in cited_tokens if t not in allow_ids]
-        if unknown:
-            # Tidak memodifikasi isi klaim; hanya beri catatan agar transparan
-            warn = (
-                "\n\n> **Catatan validasi**: Ditemukan ID yang tidak ada di daftar sumber konteks: "
-                + ", ".join(f"`{u}`" for u in unknown)
-                + ". Mohon sesuaikan dengan ID yang diizinkan di atas."
-            )
-            answer = answer + warn
-
-        # Tambahkan ringkas daftar sumber yang memang diberikan sebagai konteks
-        footer = "\n\n---\n**Sumber konteks (ID tersedia untuk jawaban ini):** " + ", ".join(f"`{i}`" for i in allow_ids)
+        # Lampirkan daftar ID sah yang dipakai sebagai konteks
+        footer = "\n\n---\n**Sumber konteks (ID tersedia untuk jawaban ini):** " + (", ".join(f"`{i}`" for i in allow_ids) if allow_ids else "—")
         return answer + footer
 
     except Exception as e:
